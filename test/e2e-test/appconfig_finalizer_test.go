@@ -101,7 +101,7 @@ var _ = Describe("Finalizer for HealthScope in ApplicationConfiguration", func()
 			func() error {
 				return k8sClient.Get(ctx, objectKey, res)
 			},
-			time.Second*60, time.Millisecond*500).Should(&util.NotFoundMatcher{})
+			time.Second*120, time.Millisecond*500).Should(&util.NotFoundMatcher{})
 		Eventually(
 			func() error {
 				return k8sClient.Create(ctx, &ns)
@@ -214,8 +214,12 @@ var _ = Describe("Finalizer for HealthScope in ApplicationConfiguration", func()
 			}, time.Second*30, time.Millisecond*500).Should(Equal(0))
 
 			By("Check AppConfig has been deleted successfully")
-			Eventually(k8sClient.Get(ctx, client.ObjectKey{Namespace: namespace, Name: appConfigName}, &appConfig),
-				time.Second*15, time.Microsecond*500).Should(&util.NotFoundMatcher{})
+			deletedAppConfig := &v1alpha2.ApplicationConfiguration{}
+			Eventually(
+				func() error {
+					return k8sClient.Get(ctx, client.ObjectKey{Namespace: namespace, Name: appConfigName}, deletedAppConfig)
+				},
+				time.Second*30, time.Microsecond*500).Should(&util.NotFoundMatcher{})
 		})
 
 	})

@@ -9,6 +9,7 @@ import (
 	"github.com/crossplane/crossplane-runtime/pkg/logging"
 	"go.uber.org/zap/zapcore"
 	"gopkg.in/natefinch/lumberjack.v2"
+	crdv1 "k8s.io/apiextensions-apiserver/pkg/apis/apiextensions/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	clientgoscheme "k8s.io/client-go/kubernetes/scheme"
 	ctrl "sigs.k8s.io/controller-runtime"
@@ -25,11 +26,12 @@ var scheme = runtime.NewScheme()
 func init() {
 	_ = clientgoscheme.AddToScheme(scheme)
 	_ = core.AddToScheme(scheme)
+	_ = crdv1.AddToScheme(scheme)
 	// +kubebuilder:scaffold:scheme
 }
 
 func main() {
-	var metricsAddr, logFilePath string
+	var metricsAddr, logFilePath, leaderElectionNamespace string
 	var enableLeaderElection, logCompress bool
 	var logRetainDate int
 	var certDir string
@@ -43,6 +45,8 @@ func main() {
 	flag.StringVar(&metricsAddr, "metrics-addr", ":8080", "The address the metric endpoint binds to.")
 	flag.BoolVar(&enableLeaderElection, "enable-leader-election", false,
 		"Enable leader election for controller manager. Enabling this will ensure there is only one active controller manager.")
+	flag.StringVar(&leaderElectionNamespace, "leader-election-namespace", "",
+		"Determines the namespace in which the leader election configmap will be created.")
 	flag.StringVar(&logFilePath, "log-file-path", "", "The address the metric endpoint binds to.")
 	flag.IntVar(&logRetainDate, "log-retain-date", 7, "The number of days of logs history to retain.")
 	flag.BoolVar(&logCompress, "log-compress", true, "Enable compression on the rotated logs.")
@@ -69,12 +73,13 @@ func main() {
 
 	oamLog := ctrl.Log.WithName("oam-kubernetes-runtime")
 	mgr, err := ctrl.NewManager(ctrl.GetConfigOrDie(), ctrl.Options{
-		Scheme:             scheme,
-		MetricsBindAddress: metricsAddr,
-		LeaderElection:     enableLeaderElection,
-		LeaderElectionID:   "oam-kubernetes-runtime",
-		Port:               webhookPort,
-		CertDir:            certDir,
+		Scheme:                  scheme,
+		MetricsBindAddress:      metricsAddr,
+		LeaderElection:          enableLeaderElection,
+		LeaderElectionID:        "oam-kubernetes-runtime",
+		LeaderElectionNamespace: leaderElectionNamespace,
+		Port:                    webhookPort,
+		CertDir:                 certDir,
 	})
 	if err != nil {
 		oamLog.Error(err, "unable to create a controller manager")
@@ -83,7 +88,11 @@ func main() {
 
 	if useWebhook {
 		oamLog.Info("OAM webhook enabled, will serving at :" + strconv.Itoa(webhookPort))
-		webhook.Add(mgr)
+		if err = webhook.Add(mgr); err != nil {
+			oamLog.Error(err, "unable to setup the webhook for core controller")
+			os.Exit(1)
+		}
+
 	}
 
 	if err = appController.Setup(mgr, controllerArgs, logging.NewLogrLogger(oamLog)); err != nil {

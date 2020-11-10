@@ -55,7 +55,6 @@ func dmWithLabel(label map[string]string) deploymentModifier {
 func dmWithAnnotation(annotation map[string]string) deploymentModifier {
 	return func(cw *appsv1.Deployment) {
 		cw.Annotations = annotation
-		cw.Spec.Template.Annotations = annotation
 	}
 }
 
@@ -388,6 +387,11 @@ func TestServiceInjector(t *testing.T) {
 		err    error
 	}
 
+	invalidDeployment := &appsv1.StatefulSet{
+		TypeMeta: metav1.TypeMeta{
+			APIVersion: "v1alpha1",
+		}}
+
 	cases := map[string]struct {
 		reason string
 		args   args
@@ -399,6 +403,21 @@ func TestServiceInjector(t *testing.T) {
 				w: &mock.Workload{},
 			},
 			want: want{},
+		},
+		"InvalidObject": {
+			reason: "invalid object should immediately return nil.",
+			args: args{
+				w: &mock.Workload{},
+				o: []oam.Object{
+					invalidDeployment,
+				},
+			},
+			want: want{
+				result: []oam.Object{
+					invalidDeployment,
+				},
+				err: nil,
+			},
 		},
 		"SuccessfulInjectService_1D_1C_1P": {
 			reason: "A Deployment with a port(s) should have a Service injected for first defined port.",

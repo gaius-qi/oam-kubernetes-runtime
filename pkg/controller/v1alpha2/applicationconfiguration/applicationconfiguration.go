@@ -18,18 +18,11 @@ package applicationconfiguration
 
 import (
 	"context"
+	"fmt"
 	"strconv"
 	"strings"
 	"time"
 
-	"github.com/crossplane/oam-kubernetes-runtime/pkg/oam"
-
-	"github.com/crossplane/crossplane-runtime/apis/core/v1alpha1"
-	runtimev1alpha1 "github.com/crossplane/crossplane-runtime/apis/core/v1alpha1"
-	"github.com/crossplane/crossplane-runtime/pkg/event"
-	"github.com/crossplane/crossplane-runtime/pkg/logging"
-	"github.com/crossplane/crossplane-runtime/pkg/meta"
-	"github.com/crossplane/crossplane-runtime/pkg/resource"
 	"github.com/pkg/errors"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime"
@@ -38,8 +31,18 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 	"sigs.k8s.io/controller-runtime/pkg/source"
 
+	"github.com/crossplane/crossplane-runtime/apis/core/v1alpha1"
+	runtimev1alpha1 "github.com/crossplane/crossplane-runtime/apis/core/v1alpha1"
+	"github.com/crossplane/crossplane-runtime/pkg/event"
+	"github.com/crossplane/crossplane-runtime/pkg/logging"
+	"github.com/crossplane/crossplane-runtime/pkg/meta"
+	"github.com/crossplane/crossplane-runtime/pkg/resource"
+
 	"github.com/crossplane/oam-kubernetes-runtime/apis/core/v1alpha2"
 	"github.com/crossplane/oam-kubernetes-runtime/pkg/controller"
+	"github.com/crossplane/oam-kubernetes-runtime/pkg/oam"
+	"github.com/crossplane/oam-kubernetes-runtime/pkg/oam/discoverymapper"
+	"github.com/crossplane/oam-kubernetes-runtime/pkg/oam/util"
 )
 
 const (
@@ -78,6 +81,10 @@ const (
 
 // Setup adds a controller that reconciles ApplicationConfigurations.
 func Setup(mgr ctrl.Manager, args controller.Args, l logging.Logger) error {
+	dm, err := discoverymapper.New(mgr.GetConfig())
+	if err != nil {
+		return fmt.Errorf("create discovery dm fail %v", err)
+	}
 	name := "oam/" + strings.ToLower(v1alpha2.ApplicationConfigurationGroupKind)
 
 	return ctrl.NewControllerManagedBy(mgr).
@@ -88,7 +95,7 @@ func Setup(mgr ctrl.Manager, args controller.Args, l logging.Logger) error {
 			Logger:        l,
 			RevisionLimit: args.RevisionLimit,
 		}).
-		Complete(NewReconciler(mgr,
+		Complete(NewReconciler(mgr, dm,
 			WithLogger(l.WithValues("controller", name)),
 			WithRecorder(event.NewAPIRecorder(mgr.GetEventRecorderFor(name)))))
 }
@@ -163,19 +170,23 @@ func WithPosthook(name string, hook ControllerHooks) ReconcilerOption {
 
 // NewReconciler returns an OAMApplicationReconciler that reconciles ApplicationConfigurations
 // by rendering and instantiating their Components and Traits.
-func NewReconciler(m ctrl.Manager, o ...ReconcilerOption) *OAMApplicationReconciler {
+func NewReconciler(m ctrl.Manager, dm discoverymapper.DiscoveryMapper, o ...ReconcilerOption) *OAMApplicationReconciler {
 	r := &OAMApplicationReconciler{
 		client: m.GetClient(),
 		scheme: m.GetScheme(),
 		components: &components{
 			client:   m.GetClient(),
+			dm:       dm,
 			params:   ParameterResolveFn(resolve),
 			workload: ResourceRenderFn(renderWorkload),
 			trait:    ResourceRenderFn(renderTrait),
 		},
 		workloads: &workloads{
-			client:    resource.NewAPIPatchingApplicator(m.GetClient()),
-			rawClient: m.GetClient(),
+			// NOTE(roywang) PatchingApplicator@v0.10.0 only use "application/merge-patch+json" type patch
+			patchingClient: resource.NewAPIPatchingApplicator(m.GetClient()),
+			updatingClient: resource.NewAPIUpdatingApplicator(m.GetClient()),
+			rawClient:      m.GetClient(),
+			dm:             dm,
 		},
 		gc:        GarbageCollectorFn(eligible),
 		log:       logging.NewNopLogger(),
@@ -208,6 +219,7 @@ func (r *OAMApplicationReconciler) Reconcile(req reconcile.Request) (result reco
 	if err := r.client.Get(ctx, req.NamespacedName, ac); err != nil {
 		return reconcile.Result{}, errors.Wrap(resource.IgnoreNotFound(err), errGetAppConfig)
 	}
+	acPatch := ac.DeepCopy()
 
 	if ac.ObjectMeta.DeletionTimestamp.IsZero() {
 		if registerFinalizers(ac) {
@@ -227,6 +239,7 @@ func (r *OAMApplicationReconciler) Reconcile(req reconcile.Request) (result reco
 
 	// execute the posthooks at the end no matter what
 	defer func() {
+		updateObservedGeneration(ac)
 		for name, hook := range r.postHooks {
 			exeResult, err := hook.Exec(ctx, ac, log)
 			if err != nil {
@@ -258,7 +271,7 @@ func (r *OAMApplicationReconciler) Reconcile(req reconcile.Request) (result reco
 
 	workloads, depStatus, err := r.components.Render(ctx, ac)
 	if err != nil {
-		log.Debug("Cannot render components", "error", err, "requeue-after", time.Now().Add(shortWait))
+		log.Info("Cannot render components", "error", err, "requeue-after", time.Now().Add(shortWait))
 		r.record.Event(ac, event.Warning(reasonCannotRenderComponents, err))
 		ac.SetConditions(v1alpha1.ReconcileError(errors.Wrap(err, errRenderComponents)))
 		return reconcile.Result{RequeueAfter: shortWait}, errors.Wrap(r.client.Status().Update(ctx, ac), errUpdateAppConfigStatus)
@@ -296,10 +309,8 @@ func (r *OAMApplicationReconciler) Reconcile(req reconcile.Request) (result reco
 		record.Event(ac, event.Normal(reasonGGComponent, "Successfully garbage collected component"))
 	}
 
-	// patch the final status
-	acPatch := client.MergeFrom(ac.DeepCopyObject())
-
-	r.updateStatus(ctx, ac, workloads)
+	// patch the final status on the client side, k8s sever can't merge them
+	r.updateStatus(ctx, ac, acPatch, workloads)
 
 	ac.Status.Dependency = v1alpha2.DependencyStatus{}
 	waitTime := longWait
@@ -308,13 +319,13 @@ func (r *OAMApplicationReconciler) Reconcile(req reconcile.Request) (result reco
 		ac.Status.Dependency = *depStatus
 	}
 
-	return reconcile.Result{RequeueAfter: waitTime},
-		errors.Wrap(r.client.Status().Patch(ctx, ac, acPatch, client.FieldOwner(ac.GetUID())), errUpdateAppConfigStatus)
+	// the posthook function will do the final status update
+	return reconcile.Result{RequeueAfter: waitTime}, nil
 }
 
-func (r *OAMApplicationReconciler) updateStatus(ctx context.Context, ac *v1alpha2.ApplicationConfiguration, workloads []Workload) {
+func (r *OAMApplicationReconciler) updateStatus(ctx context.Context, ac, acPatch *v1alpha2.ApplicationConfiguration, workloads []Workload) {
 	ac.Status.Workloads = make([]v1alpha2.WorkloadStatus, len(workloads))
-	revisionStatus := make([]v1alpha2.WorkloadStatus, 0)
+	historyWorkloads := make([]v1alpha2.HistoryWorkload, 0)
 	for i, w := range workloads {
 		ac.Status.Workloads[i] = workloads[i].Status()
 		if !w.RevisionEnabled {
@@ -323,7 +334,7 @@ func (r *OAMApplicationReconciler) updateStatus(ctx context.Context, ac *v1alpha
 		var ul unstructured.UnstructuredList
 		ul.SetKind(w.Workload.GetKind())
 		ul.SetAPIVersion(w.Workload.GetAPIVersion())
-		if err := r.client.List(ctx, &ul, client.MatchingLabels{oam.LabelAppName: ac.Name, oam.LabelAppComponent: w.ComponentName}); err != nil {
+		if err := r.client.List(ctx, &ul, client.MatchingLabels{oam.LabelAppName: ac.Name, oam.LabelAppComponent: w.ComponentName, oam.LabelOAMResourceType: oam.ResourceTypeWorkload}); err != nil {
 			continue
 		}
 		for _, v := range ul.Items {
@@ -332,10 +343,8 @@ func (r *OAMApplicationReconciler) updateStatus(ctx context.Context, ac *v1alpha
 			}
 			// These workload exists means the component is under progress of rollout
 			// Trait will not work for these remaining workload
-			revisionStatus = append(revisionStatus, v1alpha2.WorkloadStatus{
-				ComponentName:          w.ComponentName,
-				ComponentRevisionName:  v.GetName(),
-				HistoryWorkingRevision: true,
+			historyWorkloads = append(historyWorkloads, v1alpha2.HistoryWorkload{
+				Revision: v.GetName(),
 				Reference: v1alpha1.TypedReference{
 					APIVersion: v.GetAPIVersion(),
 					Kind:       v.GetKind(),
@@ -345,9 +354,41 @@ func (r *OAMApplicationReconciler) updateStatus(ctx context.Context, ac *v1alpha
 			})
 		}
 	}
-	ac.Status.Workloads = append(ac.Status.Workloads, revisionStatus...)
-
+	ac.Status.HistoryWorkloads = historyWorkloads
+	// patch the extra fields in the status that is wiped by the Status() function
+	patchExtraStatusField(&ac.Status, acPatch.Status)
 	ac.SetConditions(v1alpha1.ReconcileSuccess())
+}
+
+func updateObservedGeneration(ac *v1alpha2.ApplicationConfiguration) {
+	if ac.Status.ObservedGeneration != ac.Generation {
+		ac.Status.ObservedGeneration = ac.Generation
+	}
+}
+
+func patchExtraStatusField(acStatus *v1alpha2.ApplicationConfigurationStatus, acPatchStatus v1alpha2.ApplicationConfigurationStatus) {
+	// patch the extra status back
+	for i := range acStatus.Workloads {
+		for _, w := range acPatchStatus.Workloads {
+			// find the workload in the old status
+			if acStatus.Workloads[i].ComponentRevisionName == w.ComponentRevisionName {
+				if len(w.Status) > 0 {
+					acStatus.Workloads[i].Status = w.Status
+				}
+				// find the trait
+				for j := range acStatus.Workloads[i].Traits {
+					for _, t := range w.Traits {
+						tr := acStatus.Workloads[i].Traits[j].Reference
+						if t.Reference.APIVersion == tr.APIVersion && t.Reference.Kind == tr.Kind && t.Reference.Name == tr.Name {
+							if len(t.Status) > 0 {
+								acStatus.Workloads[i].Traits[j].Status = t.Status
+							}
+						}
+					}
+				}
+			}
+		}
+	}
 }
 
 // if any finalizers newly registered, return true
@@ -374,7 +415,7 @@ type Workload struct {
 	// ComponentName that produced this workload.
 	ComponentName string
 
-	//ComponentRevisionName of current component
+	// ComponentRevisionName of current component
 	ComponentRevisionName string
 
 	// A Workload object.
@@ -399,6 +440,9 @@ type Trait struct {
 
 	// HasDep indicates whether this resource has dependencies and unready to be applied.
 	HasDep bool
+
+	// Definition indicates the trait's definition
+	Definition v1alpha2.TraitDefinition
 }
 
 // Status produces the status of this workload and its traits, suitable for use
@@ -415,7 +459,10 @@ func (w Workload) Status() v1alpha2.WorkloadStatus {
 		Traits: make([]v1alpha2.WorkloadTrait, len(w.Traits)),
 		Scopes: make([]v1alpha2.WorkloadScope, len(w.Scopes)),
 	}
-	for i := range w.Traits {
+	for i, tr := range w.Traits {
+		if tr.Definition.Name == util.Dummy && tr.Definition.Spec.Reference.Name == util.Dummy {
+			acw.Traits[i].Message = util.DummyTraitMessage
+		}
 		acw.Traits[i].Reference = runtimev1alpha1.TypedReference{
 			APIVersion: w.Traits[i].Object.GetAPIVersion(),
 			Kind:       w.Traits[i].Object.GetKind(),
